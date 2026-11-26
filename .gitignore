@@ -1,0 +1,37 @@
+# Variables de entorno y secretos (nunca subir tokens ni claves)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Entornos virtuales
+venv/
+.venv/
+env/
+ENV/
+
+# Bytecode, cachés y empaquetados de Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.ruff_cache/
+.coverage
+
+# Base de datos local, archivos subidos y logs
+*.sqlite3
+*.sqlite3-journal
+*.log
+media/
+staticfiles/
+
+# Archivos de sistema y editores
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json
