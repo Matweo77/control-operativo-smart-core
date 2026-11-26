@@ -50,6 +50,14 @@ class ProductoSerializer(serializers.ModelSerializer):
         if hasattr(obj, "_stock_total_cache"):
             return obj._stock_total_cache
 
+        prefetched_cache = getattr(obj, "_prefetched_objects_cache", {})
+        if "inventarios" in prefetched_cache:
+            total = sum(
+                (inv.stock_actual or 0) for inv in prefetched_cache["inventarios"]
+            )
+            obj._stock_total_cache = int(total)
+            return obj._stock_total_cache
+
         inventarios = getattr(obj, "inventarios", None)
         if inventarios is not None:
             total = inventarios.aggregate(total=Sum("stock_actual"))["total"]
