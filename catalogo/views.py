@@ -1,5 +1,8 @@
+import csv
+import io
 import os
 import uuid
+from decimal import Decimal, InvalidOperation
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, unquote, urlparse
 from urllib.request import Request, urlopen
@@ -10,12 +13,10 @@ from rest_framework import status, viewsets
 from rest_framework.decorators import action
 from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.response import Response
+from auditoria.models import MovimientoInventario
 from organizacion.models import Sucursal
 from .models import Categoria, InventarioSucursal, Producto
 from .serializers import CategoriaSerializer, ProductoSerializer
-import csv
-import io
-from decimal import Decimal, InvalidOperation
 
 ALLOWED_IMAGE_TYPES = {
     "image/jpeg": ".jpg",
@@ -44,6 +45,41 @@ def _calcular_estado_stock(stock, minimo):
     if stock <= minimo:
         return "stock_bajo"
     return "normal"
+
+
+def _resolver_responsable_ajuste(request):
+    usuario = getattr(request, "user", None)
+    if usuario is not None and getattr(usuario, "is_authenticated", False):
+        full_name = ""
+        if hasattr(usuario, "get_full_name"):
+            full_name = (usuario.get_full_name() or "").strip()
+        for attr in ("nombre_completo", "nombre", "username", "email"):
+            if full_name:
+                break
+            val = getattr(usuario, attr, None)
+            if val and str(val).strip():
+                full_name = str(val).strip()
+                break
+        if full_name:
+            return full_name
+
+    extra = (request.data.get("responsable_nombre") or "").strip()
+    if extra:
+        return extra
+    return "Mostrador / Caja"
+
+
+def _resolver_tipo_movimiento_ajuste(request, delta_real):
+    solicitado = (request.data.get("tipo_movimiento") or "").strip().lower()
+    if solicitado in ("entrada", "salida", "ajuste_manual"):
+        return solicitado
+    if solicitado == "ajuste manual":
+        return "ajuste_manual"
+    if delta_real > 0:
+        return "entrada"
+    if delta_real < 0:
+        return "salida"
+    return "ajuste_manual"
 
 
 def _extraer_ruta_bucket(imagen_url, bucket):
@@ -239,6 +275,7 @@ class ProductoViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        motivo_raw = (request.data.get("motivo") or "").strip()
         sucursal_id = request.data.get("sucursal_id")
 
         with transaction.atomic():
@@ -269,7 +306,9 @@ class ProductoViewSet(viewsets.ModelViewSet):
                         estado_stock="agotado",
                     )
             elif not inventario:
-                sucursal = Sucursal.objects.filter(empresa_id=producto.empresa_id).first()
+                sucursal = Sucursal.objects.filter(
+                    empresa_id=producto.empresa_id
+                ).first()
                 if not sucursal:
                     return Response(
                         {
@@ -284,19 +323,42 @@ class ProductoViewSet(viewsets.ModelViewSet):
                     estado_stock="agotado",
                 )
 
-            nuevo_stock = max(0, (inventario.stock_actual or 0) + delta)
-            minimo = producto.stock_minimo if producto.stock_minimo is not None else 5
+            stock_anterior = inventario.stock_actual or 0
+            nuevo_stock = max(0, stock_anterior + delta)
+            delta_real = nuevo_stock - stock_anterior
+            minimo = (
+                producto.stock_minimo if producto.stock_minimo is not None else 5
+            )
             inventario.stock_actual = nuevo_stock
             inventario.estado_stock = _calcular_estado_stock(nuevo_stock, minimo)
-            inventario.save(update_fields=["stock_actual", "estado_stock", "actualizado_en"])
+            inventario.save(
+                update_fields=["stock_actual", "estado_stock", "actualizado_en"]
+            )
+
+            if delta_real != 0:
+                tipo_mov = _resolver_tipo_movimiento_ajuste(request, delta_real)
+                motivo_final = motivo_raw or (
+                    "Entrada de inventario"
+                    if tipo_mov == "entrada"
+                    else "Salida de inventario"
+                    if tipo_mov == "salida"
+                    else "Ajuste manual de stock"
+                )
+                MovimientoInventario.objects.create(
+                    sucursal=inventario.sucursal,
+                    producto=producto,
+                    usuario=None,
+                    responsable_nombre=_resolver_responsable_ajuste(request),
+                    tipo_movimiento=tipo_mov,
+                    cantidad_delta=delta_real,
+                    motivo=motivo_final,
+                )
 
             producto.refresh_from_db()
             serializer = self.get_serializer(producto)
             return Response(serializer.data, status=status.HTTP_200_OK)
 
-
-    
-    #Parse del archivo CSV para importar productos
+    # Parse del archivo CSV para importar productos
 
     @action(detail=False, methods=["post"], url_path="carga-masiva")
     def carga_masiva(self, request):
@@ -331,14 +393,22 @@ class ProductoViewSet(viewsets.ModelViewSet):
 
         sucursal_id = request.data.get("sucursal_id")
         if sucursal_id:
-            sucursal = Sucursal.objects.filter(pk=sucursal_id, empresa_id=empresa_id).first()
+            sucursal = Sucursal.objects.filter(
+                pk=sucursal_id, empresa_id=empresa_id
+            ).first()
             if not sucursal:
                 return Response(
-                    {"detail": "La sucursal indicada no existe para esta empresa."},
+                    {
+                        "detail": "La sucursal indicada no existe para esta empresa."
+                    },
                     status=status.HTTP_404_NOT_FOUND,
                 )
         else:
-            sucursal = Sucursal.objects.filter(empresa_id=empresa_id).order_by("id").first()
+            sucursal = (
+                Sucursal.objects.filter(empresa_id=empresa_id)
+                .order_by("id")
+                .first()
+            )
 
         try:
             raw_bytes = archivo.read()
@@ -348,7 +418,9 @@ class ProductoViewSet(viewsets.ModelViewSet):
                 texto = raw_bytes.decode("latin-1")
             except UnicodeDecodeError:
                 return Response(
-                    {"detail": "No se pudo leer el archivo CSV. Guárdalo en codificación UTF-8."},
+                    {
+                        "detail": "No se pudo leer el archivo CSV. Guárdalo en codificación UTF-8."
+                    },
                     status=status.HTTP_400_BAD_REQUEST,
                 )
 
@@ -468,10 +540,16 @@ class ProductoViewSet(viewsets.ModelViewSet):
                 continue
 
             categoria_nombre = get_col(row, "categoria", "categoria_nombre")
-            codigo_barras = get_col(row, "codigo_barras", "codigoBarras", "barcode") or None
-            imagen_url = get_col(row, "imagen_url", "imagenUrl", "imagen") or None
+            codigo_barras = (
+                get_col(row, "codigo_barras", "codigoBarras", "barcode") or None
+            )
+            imagen_url = (
+                get_col(row, "imagen_url", "imagenUrl", "imagen") or None
+            )
             activo_raw = get_col(row, "activo").lower()
-            activo = False if activo_raw in ("false", "0", "no", "inactivo") else True
+            activo = (
+                False if activo_raw in ("false", "0", "no", "inactivo") else True
+            )
 
             try:
                 with transaction.atomic():
@@ -517,16 +595,20 @@ class ProductoViewSet(viewsets.ModelViewSet):
                         )
                         creados += 1
 
-                    if sucursal and (tiene_stock or not producto.inventarios.exists()):
-                        inv, _ = InventarioSucursal.objects.select_for_update().get_or_create(
-                            producto=producto,
-                            sucursal=sucursal,
-                            defaults={
-                                "stock_actual": stock_inicial,
-                                "estado_stock": _calcular_estado_stock(
-                                    stock_inicial, stock_minimo
-                                ),
-                            },
+                    if sucursal and (
+                        tiene_stock or not producto.inventarios.exists()
+                    ):
+                        inv, _ = (
+                            InventarioSucursal.objects.select_for_update().get_or_create(
+                                producto=producto,
+                                sucursal=sucursal,
+                                defaults={
+                                    "stock_actual": stock_inicial,
+                                    "estado_stock": _calcular_estado_stock(
+                                        stock_inicial, stock_minimo
+                                    ),
+                                },
+                            )
                         )
                         if tiene_stock:
                             inv.stock_actual = stock_inicial
@@ -557,4 +639,4 @@ class ProductoViewSet(viewsets.ModelViewSet):
                 "total_procesadas": creados + actualizados + len(errores),
             },
             status=status.HTTP_200_OK,
-        )    
+        )

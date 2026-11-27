@@ -5,6 +5,17 @@ from clientes.models import Cliente
 from organizacion.models import PerfilUsuario, Sucursal
 from .models import DetalleVenta, Venta
 
+METODOS_PAGO_PERMITIDOS = {
+    "efectivo": "efectivo",
+    "cash": "efectivo",
+    "tarjeta": "tarjeta",
+    "debito": "tarjeta",
+    "débito": "tarjeta",
+    "transferencia": "transferencia",
+    "nequi": "transferencia",
+    "nequi / transferencia": "transferencia",
+}
+
 
 class DetalleVentaInputSerializer(serializers.Serializer):
     producto_id = serializers.UUIDField()
@@ -36,6 +47,9 @@ class VentaSerializer(serializers.ModelSerializer):
     cliente_nombre = serializers.CharField(
         source="cliente.nombre_completo", read_only=True, allow_null=True
     )
+    usuario_nombre = serializers.CharField(
+        source="usuario.nombre_completo", read_only=True, allow_null=True
+    )
     detalles = DetalleVentaSerializer(many=True, read_only=True)
 
     class Meta:
@@ -46,6 +60,7 @@ class VentaSerializer(serializers.ModelSerializer):
             "cliente",
             "cliente_nombre",
             "usuario",
+            "usuario_nombre",
             "numero_ticket",
             "subtotal",
             "impuesto_iva",
@@ -75,6 +90,9 @@ class CrearVentaSerializer(serializers.Serializer):
     usuario = serializers.PrimaryKeyRelatedField(
         queryset=PerfilUsuario.objects.all(), required=False, allow_null=True
     )
+    responsable_nombre = serializers.CharField(
+        max_length=120, required=False, allow_blank=True
+    )
     metodo_pago = serializers.CharField(max_length=50)
     tasa_iva = serializers.DecimalField(
         max_digits=5,
@@ -87,10 +105,15 @@ class CrearVentaSerializer(serializers.Serializer):
     items = DetalleVentaInputSerializer(many=True, allow_empty=False)
 
     def validate_metodo_pago(self, value):
-        limpio = (value or "").strip()
+        limpio = (value or "").strip().lower()
         if not limpio:
             raise serializers.ValidationError("El método de pago es obligatorio.")
-        return limpio
+        normalizado = METODOS_PAGO_PERMITIDOS.get(limpio)
+        if not normalizado:
+            raise serializers.ValidationError(
+                "Método de pago no válido. Usa 'efectivo', 'tarjeta' o 'transferencia'."
+            )
+        return normalizado
 
     def validate_items(self, items):
         agrupados = {}
@@ -117,25 +140,3 @@ class CrearVentaSerializer(serializers.Serializer):
             {"producto_id": pid, "cantidad": cant}
             for pid, cant in agrupados.items()
         ]
-
-#Metodos de pago permitidos y validación Array
-METODOS_PAGO_PERMITIDOS = {
-    "efectivo": "efectivo",
-    "cash": "efectivo",
-    "tarjeta": "tarjeta",
-    "debito": "tarjeta",
-    "débito": "tarjeta",
-    "transferencia": "transferencia",
-    "nequi": "transferencia",
-    "nequi / transferencia": "transferencia",
-}
-
-
-def validate_metodo_pago(self, value):
-    limpio = (value or "").strip().lower()
-    normalizado = METODOS_PAGO_PERMITIDOS.get(limpio)
-    if not normalizado:
-        raise serializers.ValidationError(
-            "Método de pago no válido. Usa 'efectivo', 'tarjeta' o 'transferencia'."
-        )
-    return normalizado

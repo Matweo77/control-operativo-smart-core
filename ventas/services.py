@@ -2,9 +2,21 @@ import re
 from decimal import Decimal, ROUND_HALF_UP
 from django.db import transaction
 from rest_framework.exceptions import ValidationError
+from auditoria.models import MovimientoInventario
 from catalogo.models import InventarioSucursal, Producto
 from organizacion.models import Sucursal
 from .models import DetalleVenta, Venta
+
+
+def _resolver_nombre_responsable(usuario, responsable_extra: str | None = None) -> str:
+    if usuario is not None:
+        for attr in ("nombre_completo", "nombre", "full_name", "email"):
+            valor = getattr(usuario, attr, None)
+            if valor and str(valor).strip():
+                return str(valor).strip()
+    if responsable_extra and str(responsable_extra).strip():
+        return str(responsable_extra).strip()
+    return "Mostrador / Caja"
 
 
 def _redondear_moneda(valor: Decimal) -> Decimal:
@@ -130,6 +142,10 @@ def registrar_venta(*, validated_data: dict) -> Venta:
         metodo_pago=metodo_pago,
     )
 
+    responsable_nombre = _resolver_nombre_responsable(
+        usuario, validated_data.get("responsable_nombre")
+    )
+
     for linea in lineas_preparadas:
         DetalleVenta.objects.create(
             venta=venta,
@@ -147,6 +163,16 @@ def registrar_venta(*, validated_data: dict) -> Venta:
             nuevo_stock, linea["producto"].stock_minimo
         )
         inventario.save(update_fields=["stock_actual", "estado_stock", "actualizado_en"])
+
+        MovimientoInventario.objects.create(
+            sucursal=sucursal,
+            producto=linea["producto"],
+            usuario=usuario,
+            responsable_nombre=responsable_nombre,
+            tipo_movimiento="venta_pos",
+            cantidad_delta=-linea["cantidad"],
+            motivo=f"Venta {venta.numero_ticket}",
+        )
 
     if cliente is not None:
         compras_actuales = Decimal(str(getattr(cliente, "total_compras", 0) or 0))
